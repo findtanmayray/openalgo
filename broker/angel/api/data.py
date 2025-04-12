@@ -1,17 +1,20 @@
-import http.client
+import httpx
 import json
 import os
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import urllib.parse
 from database.token_db import get_br_symbol, get_token, get_oa_symbol
+from utils.httpx_client import get_httpx_client
 
 def get_api_response(endpoint, auth, method="GET", payload=''):
     """Helper function to make API calls to Angel One"""
     AUTH_TOKEN = auth
     api_key = os.getenv('BROKER_API_KEY')
 
-    conn = http.client.HTTPSConnection("apiconnect.angelone.in")
+    # Get the shared httpx client with connection pooling
+    client = get_httpx_client()
+    
     headers = {
         'Authorization': f'Bearer {AUTH_TOKEN}',
         'Content-Type': 'application/json',
@@ -27,10 +30,29 @@ def get_api_response(endpoint, auth, method="GET", payload=''):
     if isinstance(payload, dict):
         payload = json.dumps(payload)
 
-    conn.request(method, endpoint, payload, headers)
-    res = conn.getresponse()
-    data = res.read()
-    return json.loads(data.decode("utf-8"))
+    url = f"https://apiconnect.angelbroking.com{endpoint}"
+    
+    try:
+        if method == "GET":
+            response = client.get(url, headers=headers)
+        elif method == "POST":
+            response = client.post(url, headers=headers, content=payload)
+        else:
+            response = client.request(method, url, headers=headers, content=payload)
+        
+        # Add status attribute for compatibility with the existing codebase
+        response.status = response.status_code
+        
+        if response.status_code == 403:
+            print(f"Debug - API returned 403 Forbidden. Headers: {headers}")
+            print(f"Debug - Response text: {response.text}")
+            raise Exception("Authentication failed. Please check your API key and auth token.")
+            
+        return json.loads(response.text)
+    except json.JSONDecodeError:
+        print(f"Debug - Failed to parse response. Status code: {response.status_code}")
+        print(f"Debug - Response text: {response.text}")
+        raise Exception(f"Failed to parse API response (status {response.status_code})")
 
 class BrokerData:  
     def __init__(self, auth_token):
@@ -64,6 +86,13 @@ class BrokerData:
             # Convert symbol to broker format and get token
             br_symbol = get_br_symbol(symbol, exchange)
             token = get_token(symbol, exchange)
+
+            if exchange == 'NSE_INDEX':
+                exchange = 'NSE'
+            elif exchange == 'BSE_INDEX':
+                exchange = 'BSE'
+            elif exchange == 'MCX_INDEX':
+                exchange = 'MCX'
             
             # Prepare payload for Angel's quote API
             payload = {
@@ -123,59 +152,139 @@ class BrokerData:
         try:
             # Convert symbol to broker format and get token
             br_symbol = get_br_symbol(symbol, exchange)
+
+            
+            
             token = get_token(symbol, exchange)
             print(f"Debug - Broker Symbol: {br_symbol}, Token: {token}")
+
+            if exchange == 'NSE_INDEX':
+                exchange = 'NSE'
+            elif exchange == 'BSE_INDEX':
+                exchange = 'BSE'
+            elif exchange == 'MCX_INDEX':
+                exchange = 'MCX'
+
             
             # Check for unsupported timeframes
             if interval not in self.timeframe_map:
                 supported = list(self.timeframe_map.keys())
                 raise Exception(f"Timeframe '{interval}' is not supported by Angel. Supported timeframes are: {', '.join(supported)}")
             
-            # Convert dates to required format (YYYY-MM-DD HH:mm)
-            from_date = datetime.strptime(start_date, '%Y-%m-%d')
-            to_date = datetime.strptime(end_date, '%Y-%m-%d')
+            # Convert dates to datetime objects
+            from_date = pd.to_datetime(start_date)
+            to_date = pd.to_datetime(end_date)
             
-            # Set time to market hours (9:15 AM to 3:30 PM)
-            from_date = from_date.replace(hour=9, minute=15)
-            to_date = to_date.replace(hour=15, minute=30)
+            # Set start time to 00:00 for the start date
+            from_date = from_date.replace(hour=0, minute=0)
             
-            # Prepare payload for historical data API
-            payload = {
-                "exchange": exchange,
-                "symboltoken": token,
-                "interval": self.timeframe_map[interval],
-                "fromdate": from_date.strftime('%Y-%m-%d %H:%M'),
-                "todate": to_date.strftime('%Y-%m-%d %H:%M')
+            # If end_date is today, set the end time to current time
+            current_time = pd.Timestamp.now()
+            if to_date.date() == current_time.date():
+                to_date = current_time.replace(second=0, microsecond=0)  # Remove seconds and microseconds
+            else:
+                # For past dates, set end time to 23:59
+                to_date = to_date.replace(hour=23, minute=59)
+            
+            # Initialize empty list to store DataFrames
+            dfs = []
+            
+            # Set chunk size based on interval as per Angel API documentation
+            interval_limits = {
+                '1m': 30,    # ONE_MINUTE
+                '3m': 60,    # THREE_MINUTE
+                '5m': 100,   # FIVE_MINUTE
+                '10m': 100,  # TEN_MINUTE
+                '15m': 200,  # FIFTEEN_MINUTE
+                '30m': 200,  # THIRTY_MINUTE
+                '1h': 400,   # ONE_HOUR
+                'D': 2000    # ONE_DAY
             }
-            print(f"Debug - API Payload: {payload}")
             
-            response = get_api_response("/rest/secure/angelbroking/historical/v1/getCandleData",
-                                      self.auth_token,
-                                      "POST",
-                                      payload)
-            print(f"Debug - API Response: {response}")
+            chunk_days = interval_limits.get(interval)
+            if not chunk_days:
+                supported = list(interval_limits.keys())
+                raise Exception(f"Interval '{interval}' not supported. Supported intervals: {', '.join(supported)}")
             
-            if not response.get('status'):
-                raise Exception(f"Error from Angel API: {response.get('message', 'Unknown error')}")
-            
-            # Extract candle data and create DataFrame
-            data = response.get('data', [])
-            if not data:
+            # Process data in chunks
+            current_start = from_date
+            while current_start <= to_date:
+                # Calculate chunk end date
+                current_end = min(current_start + timedelta(days=chunk_days-1), to_date)
+                
+                # Prepare payload for historical data API
+                payload = {
+                    "exchange": exchange,
+                    "symboltoken": token,
+                    "interval": self.timeframe_map[interval],
+                    "fromdate": current_start.strftime('%Y-%m-%d %H:%M'),
+                    "todate": current_end.strftime('%Y-%m-%d %H:%M')
+                }
+                print(f"Debug - Fetching chunk from {current_start} to {current_end}")
+                print(f"Debug - API Payload: {payload}")
+                
+                try:
+                    response = get_api_response("/rest/secure/angelbroking/historical/v1/getCandleData",
+                                              self.auth_token,
+                                              "POST",
+                                              payload)
+                    print(f"Debug - API Response Status: {response.get('status')}")
+                    
+                    # Check if response is empty or invalid
+                    if not response:
+                        print(f"Debug - Empty response for chunk {current_start} to {current_end}")
+                        current_start = current_end + timedelta(days=1)
+                        continue
+                    
+                    if not response.get('status'):
+                        print(f"Debug - Error response: {response.get('message', 'Unknown error')}")
+                        current_start = current_end + timedelta(days=1)
+                        continue
+                        
+                except Exception as chunk_error:
+                    print(f"Debug - Error fetching chunk {current_start} to {current_end}: {str(chunk_error)}")
+                    current_start = current_end + timedelta(days=1)
+                    continue
+                
+                if not response.get('status'):
+                    raise Exception(f"Error from Angel API: {response.get('message', 'Unknown error')}")
+                
+                # Extract candle data and create DataFrame
+                data = response.get('data', [])
+                if data:
+                    chunk_df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    dfs.append(chunk_df)
+                    print(f"Debug - Received {len(data)} candles for chunk")
+                else:
+                    print(f"Debug - No data received for chunk")
+                
+                # Move to next chunk
+                current_start = current_end + timedelta(days=1)
+                
+            # If no data was found, return empty DataFrame
+            if not dfs:
                 print("Debug - No data received from API")
                 return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            print(f"Debug - Received {len(data)} candles")
+            # Combine all chunks
+            df = pd.concat(dfs, ignore_index=True)
             
-            # Convert data to DataFrame
-            df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
-            # Convert timestamp to datetime then to Unix epoch
+            # Convert timestamp to datetime
             df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            # For daily timeframe, convert UTC to IST by adding 5 hours and 30 minutes
+            if interval == 'D':
+                df['timestamp'] = df['timestamp'] + pd.Timedelta(hours=5, minutes=30)
+            
+            # Convert timestamp to Unix epoch
             df['timestamp'] = df['timestamp'].astype('int64') // 10**9  # Convert to Unix epoch
             
             # Ensure numeric columns and proper order
             numeric_columns = ['open', 'high', 'low', 'close', 'volume']
             df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric)
+            
+            # Sort by timestamp and remove duplicates
+            df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp']).reset_index(drop=True)
             
             # Reorder columns to match REST API format
             df = df[['close', 'high', 'low', 'open', 'timestamp', 'volume']]
@@ -199,6 +308,13 @@ class BrokerData:
             # Convert symbol to broker format and get token
             br_symbol = get_br_symbol(symbol, exchange)
             token = get_token(symbol, exchange)
+
+            if exchange == 'NSE_INDEX':
+                exchange = 'NSE'
+            elif exchange == 'BSE_INDEX':
+                exchange = 'BSE'
+            elif exchange == 'MCX_INDEX':
+                exchange = 'MCX'
             
             # Prepare payload for market depth API
             payload = {

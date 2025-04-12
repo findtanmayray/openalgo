@@ -104,6 +104,12 @@ def transform_order_data(orders):
             print(f"Warning: Expected a dict, but found a {type(order)}. Skipping this item.")
             continue
 
+        ordertype = order.get("ordertype", "")
+        if ordertype == 'STOPLOSS_LIMIT':
+            ordertype = 'SL'
+        if ordertype == 'STOPLOSS_MARKET':
+            ordertype = 'SL-M'
+
         transformed_order = {
             "symbol": order.get("tradingsymbol", ""),
             "exchange": order.get("exchange", ""),
@@ -111,7 +117,7 @@ def transform_order_data(orders):
             "quantity": order.get("quantity", 0),
             "price": order.get("price", 0.0),
             "trigger_price": order.get("triggerprice", 0.0),
-            "pricetype": order.get("ordertype", ""),
+            "pricetype": ordertype,
             "product": order.get("producttype", ""),
             "orderid": order.get("orderid", ""),
             "order_status": order.get("status", ""),
@@ -205,6 +211,8 @@ def transform_positions_data(positions_data):
             "product": position.get('producttype', ''),
             "quantity": position.get('netqty', 0),
             "average_price": position.get('avgnetprice', 0.0),
+            "ltp": position.get('ltp', 0.0),  
+            "pnl": position.get('pnl', 0.0),  
         }
         transformed_data.append(transformed_position)
     return transformed_data
@@ -286,5 +294,3 @@ def calculate_portfolio_statistics(holdings_data):
         'totalprofitandloss': totalprofitandloss,
         'totalpnlpercentage': totalpnlpercentage
     }
-
-

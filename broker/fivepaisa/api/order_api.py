@@ -55,8 +55,12 @@ def get_holdings(auth):
 
 def get_open_position(tradingsymbol, exchange, Exch,ExchType , producttype,auth):
     #Convert Trading Symbol from OpenAlgo Format to Broker Format Before Search in OpenPosition
+    token = int(get_token(tradingsymbol, exchange))  # Convert token to integer
     tradingsymbol = get_br_symbol(tradingsymbol,exchange)
     positions_data = get_positions(auth)
+    print("Token : ",token)
+    print("Product Type : ",producttype)
+    print(positions_data)
 
 
 
@@ -64,7 +68,8 @@ def get_open_position(tradingsymbol, exchange, Exch,ExchType , producttype,auth)
 
     if positions_data and positions_data.get('body'):
         for position in positions_data['body']['NetPositionDetail']:
-            if position.get('ScripName').upper() == tradingsymbol and position.get('Exch') == Exch and position.get('ExchType') == ExchType and position.get('OrderFor') == producttype:
+
+            if position.get('ScripCode') == token and position.get('Exch') == Exch and position.get('ExchType') == ExchType and position.get('OrderFor') == producttype:
                 net_qty = position.get('NetQty', '0')
                 break  # Assuming you need the first match
 
@@ -101,7 +106,7 @@ def place_order_api(data,auth):
     response_data = json.loads(res.read().decode("utf-8"))
     print(response_data)
     if response_data['head']['statusDescription'] == "Success":
-        orderid = response_data['body']['ExchOrderID']
+        orderid = response_data['body']['BrokerOrderID']
     else:
         orderid = None
     return res, response_data, orderid
@@ -203,7 +208,7 @@ def close_all_positions(current_api_key,auth):
     AUTH_TOKEN = auth
 
     positions_response = get_positions(AUTH_TOKEN)
-
+    print(positions_response)
     # Check if the positions data is null or empty
     if positions_response['body']['NetPositionDetail'] is None or not positions_response['body']['NetPositionDetail']:
         return {"message": "No Open Positions Found"}, 200
@@ -221,7 +226,8 @@ def close_all_positions(current_api_key,auth):
 
             exchange = reverse_map_exchange(position['Exch'],position['ExchType'])
             #get openalgo symbol to send to placeorder function
-            symbol = get_oa_symbol(position['ScripName'].upper(),exchange)
+    
+            symbol = get_symbol(position['ScripCode'],exchange)
 
             # Prepare the order payload
             place_order_payload = {
@@ -252,27 +258,42 @@ def close_all_positions(current_api_key,auth):
 
 
 def cancel_order(orderid,auth):
-    # Assuming you have a function to get the authentication token
     AUTH_TOKEN = auth
 
+    # First get the order details from orderbook
+    orderbook_data = get_order_book(AUTH_TOKEN)
     
-    # Set up the request headers
+    # Find the order with matching BrokerOrderId and get its ExchOrderID
+    exch_order_id = None
+    order_data = None
+    if orderbook_data and orderbook_data.get('body') and orderbook_data['body'].get('OrderBookDetail'):
+        for order in orderbook_data['body']['OrderBookDetail']:
+            if str(order.get('BrokerOrderId')) == str(orderid):
+                exch_order_id = order.get('ExchOrderID')
+                order_data = order
+                break
+    
+    if not exch_order_id:
+        return {"status": "error", "message": f"Order {orderid} not found in orderbook"}
+
     headers = {
       'Authorization': f'bearer {AUTH_TOKEN}',
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/json'
+
     }
-    
+
     # Prepare the payload
     json_data = {
-            "head": {
-                "key": api_key
-            },
-            "body": {
-                "ExchOrderID": orderid,
-            }
+        "head": {
+            "key": api_key
+        },
+        "body": {
+                "ExchOrderID": exch_order_id,
         }
+    }
 
     payload = json.dumps(json_data)
+
     print(payload)
     
     # Establish the connection and send the request
@@ -295,8 +316,6 @@ def modify_order(data,auth):
 
     # Assuming you have a function to get the authentication token
     AUTH_TOKEN = auth
-
-
     transformed_data = transform_modify_order_data(data)  # You need to implement this function
     # Set up the request headers
 
@@ -323,7 +342,7 @@ def modify_order(data,auth):
     response = print(f'The response is {data}')
 
     if data['body']['Message'] == "Success" or data['body']['Message'] == "SUCCESS":
-        return {"status": "success", "orderid": data["body"]["ExchOrderID"]}, 200
+        return {"status": "success", "orderid": data["body"]["BrokerOrderID"]}, 200
     else:
         return {"status": "error", "message":  data.get('body', {}).get('Message', 'Failed to Modify order')}, res.status
 
@@ -349,7 +368,7 @@ def cancel_all_orders_api(data,auth):
 
     # Cancel the filtered orders
     for order in orders_to_cancel:
-        orderid = order['ExchOrderID']
+        orderid = order['BrokerOrderId']
         cancel_response, status_code = cancel_order(orderid,auth)
         if status_code == 200:
             canceled_orders.append(orderid)
@@ -357,4 +376,3 @@ def cancel_all_orders_api(data,auth):
             failed_cancellations.append(orderid)
     
     return canceled_orders, failed_cancellations
-
