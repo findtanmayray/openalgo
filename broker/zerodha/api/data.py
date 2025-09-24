@@ -1,16 +1,17 @@
-import http.client
 import json
 import os
 import urllib.parse
 from database.token_db import get_br_symbol, get_oa_symbol
 from broker.zerodha.database.master_contract_db import SymToken, db_session
-import logging
 import pandas as pd
 from datetime import datetime, timedelta
+from utils.httpx_client import get_httpx_client
+from utils.logging import get_logger
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+
+
 
 class ZerodhaPermissionError(Exception):
     """Custom exception for Zerodha API permission errors"""
@@ -20,53 +21,112 @@ class ZerodhaAPIError(Exception):
     """Custom exception for other Zerodha API errors"""
     pass
 
-def get_api_response(endpoint, auth, method="GET", payload=''):
+def get_api_response(endpoint, auth, method="GET", payload=None):
+    """
+    Make an API request to Zerodha's API using shared httpx client with connection pooling.
+    
+    Args:
+        endpoint (str): API endpoint (e.g., '/quote')
+        auth (str): Authentication token
+        method (str): HTTP method (GET, POST, etc.)
+        payload (dict, optional): Request payload for POST requests
+        
+    Returns:
+        dict: API response data
+        
+    Raises:
+        ZerodhaPermissionError: For permission-related errors
+        ZerodhaAPIError: For other API errors
+    """
     AUTH_TOKEN = auth
-    conn = http.client.HTTPSConnection("api.kite.trade")
+    base_url = 'https://api.kite.trade'
+    
+    # Get the shared httpx client with connection pooling
+    client = get_httpx_client()
+    
     headers = {
         'X-Kite-Version': '3',
         'Authorization': f'token {AUTH_TOKEN}',
         'Content-Type': 'application/json'
     }
-
+    
+    # For GET requests, include params in URL
+    params = {}
+    if method.upper() == 'GET' and '?' in endpoint:
+        # Extract query params from endpoint
+        path, query = endpoint.split('?', 1)
+        params = dict(urllib.parse.parse_qsl(query))
+        endpoint = path
+    
+    url = f"{base_url}{endpoint}"
+    
     try:
         # Log the complete request details for debugging
-        logger.info("=== API Request Details ===")
-        logger.info(f"URL: https://api.kite.trade{endpoint}")
-        logger.info(f"Method: {method}")
-        logger.info(f"Headers: {json.dumps(headers, indent=2)}")
+        #logger.info("=== API Request Details ===")
+        #logger.info(f"URL: {url}")
+        #logger.info(f"Method: {method}")
+        #logger.info(f"Headers: {json.dumps(headers, indent=2)}")
         if payload:
-            logger.info(f"Payload: {payload}")
-
-        conn.request(method, endpoint, payload, headers)
-        res = conn.getresponse()
-        data = res.read()
-        response = json.loads(data.decode("utf-8"))
-
+            logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
+        if params:
+            logger.debug(f"Params: {json.dumps(params, indent=2)}")
+        
+        # Make the request using the shared client
+        if method.upper() == 'GET':
+            response = client.get(
+                url,
+                headers=headers,
+                params=params
+            )
+        elif method.upper() == 'POST':
+            headers['Content-Type'] = 'application/json'
+            response = client.post(
+                url,
+                headers=headers,
+                params=params,
+                json=payload
+            )
+        else:
+            raise ZerodhaAPIError(f"Unsupported HTTP method: {method}")
+            
         # Log the complete response
-        logger.info("=== API Response Details ===")
-        logger.info(f"Status Code: {res.status}")
-        logger.info(f"Response Headers: {dict(res.getheaders())}")
-        logger.info(f"Response Body: {json.dumps(response, indent=2)}")
-
+        #logger.info("=== API Response Details ===")
+        logger.debug(f"Status Code: {response.status_code}")
+        logger.debug(f"Response Headers: {dict(response.headers)}")
+        logger.debug(f"Response Body: {response.text}")
+        
+        # Parse JSON response
+        response_data = response.json()
+        
         # Check for permission errors
-        if response.get('status') == 'error':
-            error_type = response.get('error_type')
-            error_message = response.get('message', 'Unknown error')
+        if response_data.get('status') == 'error':
+            error_type = response_data.get('error_type')
+            error_message = response_data.get('message', 'Unknown error')
             
             if error_type == 'PermissionException' or 'permission' in error_message.lower():
                 raise ZerodhaPermissionError(f"API Permission denied: {error_message}.")
             else:
                 raise ZerodhaAPIError(f"API Error: {error_message}")
-
-        return response
+                
+        return response_data
+        
     except ZerodhaPermissionError:
         raise
     except ZerodhaAPIError:
         raise
     except Exception as e:
-        logger.error(f"API request failed: {str(e)}")
-        raise ZerodhaAPIError(f"API request failed: {str(e)}")
+        error_msg = str(e)
+        logger.exception(f"API request failed: {error_msg}")
+        
+        # Try to extract more error details if available
+        try:
+            if hasattr(e, 'response') and e.response is not None:
+                error_detail = e.response.json()
+                error_msg = error_detail.get('message', error_msg)
+        except:
+            pass
+            
+        raise ZerodhaAPIError(f"API request failed: {error_msg}")
 
 class BrokerData:
     def __init__(self, auth_token):
@@ -137,7 +197,7 @@ class BrokerData:
         try:
             # Convert symbol to broker format
             br_symbol = get_br_symbol(symbol, exchange)
-            logger.info(f"Fetching quotes for {exchange}:{br_symbol}")
+            logger.debug(f"Fetching quotes for {exchange}:{br_symbol}")
             
             # Get exchange_token from database
             with db_session() as session:
@@ -176,15 +236,16 @@ class BrokerData:
                 'ltp': quote.get('last_price', 0),
                 'open': quote.get('ohlc', {}).get('open', 0),
                 'prev_close': quote.get('ohlc', {}).get('close', 0),
-                'volume': quote.get('volume', 0)
+                'volume': quote.get('volume', 0),
+                'oi': quote.get('oi', 0)
             }
             
         except ZerodhaPermissionError as e:
-            logger.error(f"Permission error fetching quotes: {str(e)}")
+            logger.exception(f"Permission error fetching quotes: {e}")
             raise
         except (ZerodhaAPIError, Exception) as e:
-            logger.error(f"Error fetching quotes: {str(e)}")
-            raise ZerodhaAPIError(f"Error fetching quotes: {str(e)}")
+            logger.exception(f"Error fetching quotes: {e}")
+            raise ZerodhaAPIError(f"Error fetching quotes: {e}")
 
     def get_history(self, symbol: str, exchange: str, timeframe: str, from_date: str, to_date: str) -> pd.DataFrame:
         """
@@ -219,7 +280,7 @@ class BrokerData:
                     all_symbols = session.query(SymToken).filter(
                         SymToken.exchange == exchange
                     ).all()
-                    logger.info(f"All matching symbols in DB: {[(s.symbol, s.brsymbol, s.exchange, s.brexchange, s.token) for s in all_symbols]}")
+                    logger.debug(f"All matching symbols in DB: {[(s.symbol, s.brsymbol, s.exchange, s.brexchange, s.token) for s in all_symbols]}")
                     raise Exception(f"Could not find instrument token for {exchange}:{symbol}")
                 
                 # Split token to get instrument_token for historical data
@@ -248,11 +309,11 @@ class BrokerData:
                 to_str = current_end.strftime('%Y-%m-%d+23:59:59')
                 
                 # Log the request details
-                logger.info(f"Fetching {resolution} data for {exchange}:{symbol} from {from_str} to {to_str}")
+                logger.debug(f"Fetching {resolution} data for {exchange}:{symbol} from {from_str} to {to_str}")
                 
                 # Construct endpoint
-                endpoint = f"/instruments/historical/{instrument_token}/{resolution}?from={from_str}&to={to_str}"
-                logger.info(f"Making request to endpoint: {endpoint}")
+                endpoint = f"/instruments/historical/{instrument_token}/{resolution}?from={from_str}&to={to_str}&oi=1"
+                logger.debug(f"Making request to endpoint: {endpoint}")
                 
                 # Use get_api_response
                 response = get_api_response(endpoint, self.auth_token)
@@ -264,7 +325,7 @@ class BrokerData:
                 # Convert to DataFrame
                 candles = response.get('data', {}).get('candles', [])
                 if candles:
-                    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
                     dfs.append(df)
                 
                 # Move to next chunk
@@ -272,13 +333,18 @@ class BrokerData:
                 
             # If no data was found, return empty DataFrame
             if not dfs:
-                return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
             
             # Combine all chunks
             final_df = pd.concat(dfs, ignore_index=True)
             
             # Convert timestamp to epoch properly using ISO format
             final_df['timestamp'] = pd.to_datetime(final_df['timestamp'], format='ISO8601')
+            
+            # For daily timeframe, convert UTC to IST by adding 5 hours and 30 minutes
+            if timeframe == 'D':
+                final_df['timestamp'] = final_df['timestamp'] + pd.Timedelta(hours=5, minutes=30)
+            
             final_df['timestamp'] = final_df['timestamp'].astype('int64') // 10**9  # Convert nanoseconds to seconds
             
             # Sort by timestamp and remove duplicates
@@ -286,15 +352,16 @@ class BrokerData:
             
             # Ensure volume is integer
             final_df['volume'] = final_df['volume'].astype(int)
+            final_df['oi'] = final_df['oi'].astype(int)
             
             return final_df
                 
         except ZerodhaPermissionError as e:
-            logger.error(f"Permission error fetching historical data: {str(e)}")
+            logger.exception(f"Permission error fetching historical data: {e}")
             raise
         except (ZerodhaAPIError, Exception) as e:
-            logger.error(f"Error fetching historical data: {str(e)}")
-            raise ZerodhaAPIError(f"Error fetching historical data: {str(e)}")
+            logger.exception(f"Error fetching historical data: {e}")
+            raise ZerodhaAPIError(f"Error fetching historical data: {e}")
 
     def get_market_depth(self, symbol: str, exchange: str) -> dict:
         """
@@ -308,7 +375,7 @@ class BrokerData:
         try:
             # Convert symbol to broker format
             br_symbol = get_br_symbol(symbol, exchange)
-            logger.info(f"Fetching market depth for {exchange}:{br_symbol}")
+            logger.debug(f"Fetching market depth for {exchange}:{br_symbol}")
             
             # Get exchange_token from database
             with db_session() as session:

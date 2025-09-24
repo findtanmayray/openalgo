@@ -2,11 +2,17 @@ from flask import Blueprint, jsonify, request, render_template, session, redirec
 from importlib import import_module
 from database.auth_db import get_auth_token
 from utils.session import check_session_validity
-import logging
+from services.place_smart_order_service import place_smart_order
+from services.close_position_service import close_position
+from services.orderbook_service import get_orderbook
+from services.tradebook_service import get_tradebook
+from services.positionbook_service import get_positionbook
+from services.holdings_service import get_holdings
+from utils.logging import get_logger
 import csv
 import io
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Define the blueprint
 orders_bp = Blueprint('orders_bp', __name__, url_prefix='/')
@@ -106,172 +112,116 @@ def generate_positions_csv(positions_data):
 @orders_bp.route('/orderbook')
 @check_session_validity
 def orderbook():
-    broker = session.get('broker')
-    if not broker:
-        logger.error("Broker not set in session")
-        return "Broker not set in session", 400
-
-    # Dynamically import broker-specific modules for API and mapping
-    api_funcs = dynamic_import(broker, 'api.order_api', ['get_order_book'])
-    mapping_funcs = dynamic_import(broker, 'mapping.order_data', [
-        'calculate_order_statistics', 'map_order_data', 
-        'transform_order_data'
-    ])
-
-    if not api_funcs or not mapping_funcs:
-        logger.error(f"Error loading broker-specific modules for {broker}")
-        return "Error loading broker-specific modules", 500
-
-    # Static import used for auth token retrieval
     login_username = session['user']
     auth_token = get_auth_token(login_username)
-
+    
     if auth_token is None:
         logger.warning(f"No auth token found for user {login_username}")
         return redirect(url_for('auth.logout'))
 
-    order_data = api_funcs['get_order_book'](auth_token)
-    logger.debug(f"Order data received: {order_data}")
+    broker = session.get('broker')
+    if not broker:
+        logger.error("Broker not set in session")
+        return "Broker not set in session", 400
     
-    if 'status' in order_data:
-        if order_data['status'] == 'error':
-            logger.error("Error in order data response")
-            return redirect(url_for('auth.logout'))
-
-    order_data = mapping_funcs['map_order_data'](order_data=order_data)
-    order_stats = mapping_funcs['calculate_order_statistics'](order_data)
-    order_data = mapping_funcs['transform_order_data'](order_data)
+    # Use the centralized orderbook service
+    success, response, status_code = get_orderbook(auth_token=auth_token, broker=broker)
+    
+    if not success:
+        logger.error(f"Failed to get orderbook data: {response.get('message', 'Unknown error')}")
+        if status_code == 404:
+            return "Failed to import broker module", 500
+        return redirect(url_for('auth.logout'))
+    
+    data = response.get('data', {})
+    order_data = data.get('orders', [])
+    order_stats = data.get('statistics', {})
 
     return render_template('orderbook.html', order_data=order_data, order_stats=order_stats)
 
 @orders_bp.route('/tradebook')
 @check_session_validity
 def tradebook():
-    broker = session.get('broker')
-    if not broker:
-        logger.error("Broker not set in session")
-        return "Broker not set in session", 400
-
-    # Dynamically import broker-specific modules for API and mapping
-    api_funcs = dynamic_import(broker, 'api.order_api', ['get_trade_book'])
-    mapping_funcs = dynamic_import(broker, 'mapping.order_data', [
-        'map_trade_data', 'transform_tradebook_data'
-    ])
-
-    if not api_funcs or not mapping_funcs:
-        logger.error(f"Error loading broker-specific modules for {broker}")
-        return "Error loading broker-specific modules", 500
-
     login_username = session['user']
     auth_token = get_auth_token(login_username)
-
+    
     if auth_token is None:
         logger.warning(f"No auth token found for user {login_username}")
         return redirect(url_for('auth.logout'))
 
-    # Using the dynamically imported `get_trade_book` function
-    get_trade_book = api_funcs['get_trade_book']
-    tradebook_data = get_trade_book(auth_token)
-    logger.debug(f"Tradebook data received: {tradebook_data}")
-  
-    if 'status' in tradebook_data and tradebook_data['status'] == 'error':
-        logger.error("Error in tradebook data response")
+    broker = session.get('broker')
+    if not broker:
+        logger.error("Broker not set in session")
+        return "Broker not set in session", 400
+    
+    # Use the centralized tradebook service
+    success, response, status_code = get_tradebook(auth_token=auth_token, broker=broker)
+    
+    if not success:
+        logger.error(f"Failed to get tradebook data: {response.get('message', 'Unknown error')}")
+        if status_code == 404:
+            return "Failed to import broker module", 500
         return redirect(url_for('auth.logout'))
-
-    # Using the dynamically imported mapping functions
-    map_trade_data = mapping_funcs['map_trade_data']
-    transform_tradebook_data = mapping_funcs['transform_tradebook_data']
-
-    tradebook_data = map_trade_data(trade_data=tradebook_data)
-    tradebook_data = transform_tradebook_data(tradebook_data)
+    
+    tradebook_data = response.get('data', [])
 
     return render_template('tradebook.html', tradebook_data=tradebook_data)
 
 @orders_bp.route('/positions')
 @check_session_validity
 def positions():
-    broker = session.get('broker')
-    if not broker:
-        logger.error("Broker not set in session")
-        return "Broker not set in session", 400
-
-    # Dynamically import broker-specific modules for API and mapping
-    api_funcs = dynamic_import(broker, 'api.order_api', ['get_positions'])
-    mapping_funcs = dynamic_import(broker, 'mapping.order_data', [
-        'map_position_data', 'transform_positions_data'
-    ])
-
-    if not api_funcs or not mapping_funcs:
-        logger.error(f"Error loading broker-specific modules for {broker}")
-        return "Error loading broker-specific modules", 500
-
     login_username = session['user']
     auth_token = get_auth_token(login_username)
-
+    
     if auth_token is None:
         logger.warning(f"No auth token found for user {login_username}")
         return redirect(url_for('auth.logout'))
 
-    # Using the dynamically imported `get_positions` function
-    get_positions = api_funcs['get_positions']
-    positions_data = get_positions(auth_token)
-    logger.debug(f"Positions data received: {positions_data}")
-   
-    if 'status' in positions_data and positions_data['status'] == 'error':
-        logger.error("Error in positions data response")
+    broker = session.get('broker')
+    if not broker:
+        logger.error("Broker not set in session")
+        return "Broker not set in session", 400
+    
+    # Use the centralized positionbook service
+    success, response, status_code = get_positionbook(auth_token=auth_token, broker=broker)
+    
+    if not success:
+        logger.error(f"Failed to get positions data: {response.get('message', 'Unknown error')}")
+        if status_code == 404:
+            return "Failed to import broker module", 500
         return redirect(url_for('auth.logout'))
-
-    # Using the dynamically imported mapping functions
-    map_position_data = mapping_funcs['map_position_data']
-    transform_positions_data = mapping_funcs['transform_positions_data']
-
-    positions_data = map_position_data(positions_data)
-    positions_data = transform_positions_data(positions_data)
+    
+    positions_data = response.get('data', [])
     
     return render_template('positions.html', positions_data=positions_data)
 
 @orders_bp.route('/holdings')
 @check_session_validity
 def holdings():
-    broker = session.get('broker')
-    if not broker:
-        logger.error("Broker not set in session")
-        return "Broker not set in session", 400
-
-    # Dynamically import broker-specific modules for API and mapping
-    api_funcs = dynamic_import(broker, 'api.order_api', ['get_holdings'])
-    mapping_funcs = dynamic_import(broker, 'mapping.order_data', [
-        'map_portfolio_data', 'calculate_portfolio_statistics', 'transform_holdings_data'
-    ])
-
-    if not api_funcs or not mapping_funcs:
-        logger.error(f"Error loading broker-specific modules for {broker}")
-        return "Error loading broker-specific modules", 500
-
     login_username = session['user']
     auth_token = get_auth_token(login_username)
-
+    
     if auth_token is None:
         logger.warning(f"No auth token found for user {login_username}")
         return redirect(url_for('auth.logout'))
 
-    # Using the dynamically imported `get_holdings` function
-    get_holdings = api_funcs['get_holdings']
-    holdings_data = get_holdings(auth_token)
-    logger.debug(f"Holdings data received: {holdings_data}")
-
-    if 'status' in holdings_data and holdings_data['status'] == 'error':
-        logger.error("Error in holdings data response")
+    broker = session.get('broker')
+    if not broker:
+        logger.error("Broker not set in session")
+        return "Broker not set in session", 400
+    
+    # Use the centralized holdings service
+    success, response, status_code = get_holdings(auth_token=auth_token, broker=broker)
+    
+    if not success:
+        logger.error(f"Failed to get holdings data: {response.get('message', 'Unknown error')}")
+        if status_code == 404:
+            return "Failed to import broker module", 500
         return redirect(url_for('auth.logout'))
-
-    # Using the dynamically imported mapping functions
-    map_portfolio_data = mapping_funcs['map_portfolio_data']
-    calculate_portfolio_statistics = mapping_funcs['calculate_portfolio_statistics']
-    transform_holdings_data = mapping_funcs['transform_holdings_data']
-
-    holdings_data = map_portfolio_data(holdings_data)
-    portfolio_stats = calculate_portfolio_statistics(holdings_data)
-    holdings_data = transform_holdings_data(holdings_data)
+    
+    data = response.get('data', {})
+    holdings_data = data.get('holdings', [])
+    portfolio_stats = data.get('statistics', {})
     
     return render_template('holdings.html', holdings_data=holdings_data, portfolio_stats=portfolio_stats)
 
@@ -399,3 +349,196 @@ def export_positions():
     except Exception as e:
         logger.error(f"Error exporting positions: {str(e)}")
         return "Error exporting positions", 500
+
+@orders_bp.route('/close_position', methods=['POST'])
+@check_session_validity
+def close_position():
+    """Close a specific position directly using the broker API"""
+    try:
+        # Get data from request
+        data = request.json
+        symbol = data.get('symbol')
+        exchange = data.get('exchange')
+        product = data.get('product')
+        
+        if not all([symbol, exchange, product]):
+            return jsonify({
+                'status': 'error',
+                'message': 'Missing required parameters (symbol, exchange, product)'
+            }), 400
+        
+        # Get auth token from session
+        login_username = session['user']
+        auth_token = get_auth_token(login_username)
+        broker_name = session.get('broker')
+        
+        if not auth_token or not broker_name:
+            return jsonify({
+                'status': 'error',
+                'message': 'Authentication error'
+            }), 401
+        
+        # Dynamically import broker-specific modules for API
+        api_funcs = dynamic_import(broker_name, 'api.order_api', ['place_smartorder_api', 'get_open_position'])
+        
+        if not api_funcs:
+            logger.error(f"Error loading broker-specific modules for {broker_name}")
+            return jsonify({
+                'status': 'error',
+                'message': 'Error loading broker modules'
+            }), 500
+        
+        # Get the functions we need
+        place_smartorder_api = api_funcs['place_smartorder_api']
+        
+        # Prepare order data for direct broker API call
+        order_data = {
+            "strategy": "UI Exit Position",
+            "exchange": exchange,
+            "symbol": symbol,
+            "action": "BUY",  # Will be determined by the smart order API based on current position
+            "product": product,
+            "pricetype": "MARKET",
+            "quantity": "0",
+            "price": "0",
+            "trigger_price": "0",
+            "disclosed_quantity": "0",
+            "position_size": "0"  # Setting to 0 to close the position
+        }
+        
+        # Call the broker API directly
+        res, response, orderid = place_smartorder_api(order_data, auth_token)
+        
+        # Format the response based on presence of orderid and broker's response
+        if orderid:
+            response_data = {
+                'status': 'success',
+                'message': response.get('message') if response and 'message' in response else 'Position close order placed successfully.',
+                'orderid': orderid
+            }
+            status_code = 200
+        else:
+            # No orderid, definite error
+            response_data = {
+                'status': 'error',
+                'message': response.get('message') if response and 'message' in response else 'Failed to close position (broker did not return order ID).'
+            }
+            if res and hasattr(res, 'status') and isinstance(res.status, int) and res.status >= 400:
+                status_code = res.status  # Use broker's HTTP error code if available
+            else:
+                status_code = 400 # Default to Bad Request
+        
+        return jsonify(response_data), status_code
+        
+    except Exception as e:
+        logger.error(f"Error in close_position endpoint: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': f'An error occurred: {str(e)}'
+        }), 500
+
+@orders_bp.route('/close_all_positions', methods=['POST'])
+@check_session_validity
+def close_all_positions():
+    """Close all open positions using the broker API"""
+    try:
+        # Get auth token from session
+        login_username = session['user']
+        auth_token = get_auth_token(login_username)
+        broker_name = session.get('broker')
+        
+        if not auth_token or not broker_name:
+            return jsonify({
+                'status': 'error',
+                'message': 'Authentication error'
+            }), 401
+        
+        # Dynamically import broker-specific modules for API
+        api_funcs = dynamic_import(broker_name, 'api.order_api', ['close_all_positions'])
+        
+        if not api_funcs or 'close_all_positions' not in api_funcs:
+            logger.error(f"Error loading broker-specific modules for {broker_name}")
+            return jsonify({
+                'status': 'error',
+                'message': 'Error loading broker modules'
+            }), 500
+        
+        # Use the broker's close_all_positions function directly
+        response_code, status_code = api_funcs['close_all_positions']('', auth_token)
+        
+        if status_code == 200:
+            response_data = {
+                'status': 'success',
+                'message': 'All Open Positions Squared Off'
+            }
+            return jsonify(response_data), 200
+        else:
+            message = response_code.get('message', 'Failed to close positions') if isinstance(response_code, dict) else 'Failed to close positions'
+            error_response = {
+                'status': 'error',
+                'message': message
+            }
+            return jsonify(error_response), status_code
+        
+    except Exception as e:
+        logger.error(f"Error in close_all_positions endpoint: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': f'An error occurred: {str(e)}'
+        }), 500
+
+@orders_bp.route('/cancel_all_orders', methods=['POST'])
+@check_session_validity
+def cancel_all_orders_ui():
+    """Cancel all open orders using the broker API from UI"""
+    try:
+        # Get auth token from session
+        login_username = session['user']
+        auth_token = get_auth_token(login_username)
+        broker_name = session.get('broker')
+        
+        if not auth_token or not broker_name:
+            return jsonify({
+                'status': 'error',
+                'message': 'Authentication error'
+            }), 401
+        
+        # Import the cancel_all_orders service
+        from services.cancel_all_order_service import cancel_all_orders
+        
+        # Call the service with auth_token and broker
+        success, response_data, status_code = cancel_all_orders(
+            order_data={},
+            auth_token=auth_token,
+            broker=broker_name
+        )
+        
+        # Format the response for UI
+        if success and status_code == 200:
+            canceled_count = len(response_data.get('canceled_orders', []))
+            failed_count = len(response_data.get('failed_cancellations', []))
+            
+            if canceled_count > 0 or failed_count == 0:
+                message = f'Successfully canceled {canceled_count} orders'
+                if failed_count > 0:
+                    message += f' (Failed to cancel {failed_count} orders)'
+                return jsonify({
+                    'status': 'success',
+                    'message': message,
+                    'canceled_orders': response_data.get('canceled_orders', []),
+                    'failed_cancellations': response_data.get('failed_cancellations', [])
+                }), 200
+            else:
+                return jsonify({
+                    'status': 'info',
+                    'message': 'No open orders to cancel'
+                }), 200
+        else:
+            return jsonify(response_data), status_code
+        
+    except Exception as e:
+        logger.error(f"Error in cancel_all_orders_ui endpoint: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': f'An error occurred: {str(e)}'
+        }), 500

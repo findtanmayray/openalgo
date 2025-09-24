@@ -13,6 +13,10 @@ from argon2.exceptions import VerifyMismatchError
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from utils.logging import get_logger
+
+# Initialize logger
+logger = get_logger(__name__)
 
 # Initialize Argon2 hasher
 ph = PasswordHasher()
@@ -35,10 +39,49 @@ def get_encryption_key():
 # Initialize Fernet cipher
 fernet = get_encryption_key()
 
-# Define a cache for the auth tokens with a 30-second TTL
-auth_cache = TTLCache(maxsize=1024, ttl=30)
-# Define a separate cache for feed tokens with a 30-second TTL
-feed_token_cache = TTLCache(maxsize=1024, ttl=30)
+# Calculate cache TTL based on session expiry time to minimize DB hits
+def get_session_based_cache_ttl():
+    """Calculate cache TTL based on daily session expiry time in .env"""
+    try:
+        import pytz
+        from datetime import datetime
+        
+        # Get session expiry time from environment (default 3 AM)
+        expiry_time = os.getenv('SESSION_EXPIRY_TIME', '03:00')
+        hour, minute = map(int, expiry_time.split(':'))
+        
+        # Calculate time until next session expiry
+        now_utc = datetime.now(pytz.timezone('UTC'))
+        now_ist = now_utc.astimezone(pytz.timezone('Asia/Kolkata'))
+        
+        # Today's expiry time
+        today_expiry = now_ist.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        
+        # If we've passed today's expiry, use tomorrow's expiry
+        if now_ist >= today_expiry:
+            from datetime import timedelta
+            today_expiry += timedelta(days=1)
+        
+        # Calculate seconds until expiry
+        time_until_expiry = (today_expiry - now_ist).total_seconds()
+        
+        # Use time until session expiry, with reasonable bounds
+        # Minimum 5 minutes, maximum 24 hours
+        ttl_seconds = max(300, min(time_until_expiry, 24 * 3600))
+        
+        logger.debug(f"Auth cache TTL set to {ttl_seconds} seconds until session expiry at {today_expiry.strftime('%H:%M IST')}")
+        return int(ttl_seconds)
+        
+    except Exception as e:
+        logger.warning(f"Could not calculate session-based cache TTL, using 5-minute default: {e}")
+        return 300  # Fallback to 5 minutes
+
+# Define auth token cache with TTL until session expiry to minimize DB hits
+auth_cache = TTLCache(maxsize=1024, ttl=get_session_based_cache_ttl())
+# Define feed token cache with same TTL
+feed_token_cache = TTLCache(maxsize=1024, ttl=get_session_based_cache_ttl())
+# Define a cache for broker names with a 5-minute TTL (longer since broker rarely changes)
+broker_cache = TTLCache(maxsize=1024, ttl=3000)
 
 engine = create_engine(
     DATABASE_URL,
@@ -70,7 +113,7 @@ class ApiKeys(Base):
     created_at = Column(DateTime(timezone=True), default=func.now())
 
 def init_db():
-    print("Initializing Auth DB")
+    logger.info("Initializing Auth DB")
     Base.metadata.create_all(bind=engine)
 
 def encrypt_token(token):
@@ -86,7 +129,7 @@ def decrypt_token(encrypted_token):
     try:
         return fernet.decrypt(encrypted_token.encode()).decode()
     except Exception as e:
-        print(f"Error decrypting token: {e}")
+        logger.error(f"Error decrypting token: {e}")
         return None
 
 def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=False):
@@ -101,6 +144,16 @@ def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=
         auth_obj.broker = broker
         auth_obj.user_id = user_id
         auth_obj.is_revoked = revoke
+        
+        # Clear cache entries when revoking
+        if revoke:
+            cache_key_auth = f"auth-{name}"
+            cache_key_feed = f"feed-{name}"
+            if cache_key_auth in auth_cache:
+                del auth_cache[cache_key_auth]
+            if cache_key_feed in feed_token_cache:
+                del feed_token_cache[cache_key_feed]
+            logger.info(f"Cleared cache entries for revoked tokens of user: {name}")
     else:
         auth_obj = Auth(name=name, auth=encrypted_token, feed_token=encrypted_feed_token, broker=broker, user_id=user_id, is_revoked=revoke)
         db_session.add(auth_obj)
@@ -109,6 +162,11 @@ def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=
 
 def get_auth_token(name):
     """Get decrypted auth token"""
+    # Handle None or empty name gracefully
+    if not name:
+        logger.debug("get_auth_token called with empty/None name, returning None")
+        return None
+        
     cache_key = f"auth-{name}"
     if cache_key in auth_cache:
         auth_obj = auth_cache[cache_key]
@@ -126,18 +184,30 @@ def get_auth_token(name):
 
 def get_auth_token_dbquery(name):
     try:
+        # Handle None or empty name gracefully
+        if not name:
+            logger.debug("get_auth_token_dbquery called with empty/None name")
+            return None
+            
         auth_obj = Auth.query.filter_by(name=name).first()
         if auth_obj and not auth_obj.is_revoked:
             return auth_obj
         else:
-            print(f"No valid auth token found for name '{name}'.")
+            # Only log warning for actual usernames, not None/empty
+            if name:
+                logger.warning(f"No valid auth token found for name '{name}'.")
             return None
     except Exception as e:
-        print("Error while querying the database for auth token:", e)
+        logger.error(f"Error while querying the database for auth token: {e}")
         return None
 
 def get_feed_token(name):
     """Get decrypted feed token"""
+    # Handle None or empty name gracefully
+    if not name:
+        logger.debug("get_feed_token called with empty/None name, returning None")
+        return None
+        
     cache_key = f"feed-{name}"
     if cache_key in feed_token_cache:
         auth_obj = feed_token_cache[cache_key]
@@ -155,14 +225,39 @@ def get_feed_token(name):
 
 def get_feed_token_dbquery(name):
     try:
+        # Handle None or empty name gracefully  
+        if not name:
+            logger.debug("get_feed_token_dbquery called with empty/None name")
+            return None
+            
         auth_obj = Auth.query.filter_by(name=name).first()
         if auth_obj and not auth_obj.is_revoked:
             return auth_obj
         else:
-            print(f"No valid feed token found for name '{name}'.")
+            # Only log warning for actual usernames, not None/empty
+            if name:
+                logger.warning(f"No valid feed token found for name '{name}'.")
             return None
     except Exception as e:
-        print("Error while querying the database for feed token:", e)
+        logger.error(f"Error while querying the database for feed token: {e}")
+        return None
+
+def get_user_id(name):
+    """Get the stored user_id (DefinEdge uid) for a user"""
+    try:
+        if not name:
+            logger.debug("get_user_id called with empty/None name")
+            return None
+            
+        auth_obj = Auth.query.filter_by(name=name).first()
+        if auth_obj and not auth_obj.is_revoked:
+            return auth_obj.user_id  # This should return "1272808" for DefinEdge
+        else:
+            if name:
+                logger.warning(f"No valid user_id found for name '{name}'.")
+            return None
+    except Exception as e:
+        logger.error(f"Error while querying the database for user_id: {e}")
         return None
 
 def upsert_api_key(user_id, api_key):
@@ -194,7 +289,7 @@ def get_api_key(user_id):
         api_key_obj = ApiKeys.query.filter_by(user_id=user_id).first()
         return api_key_obj is not None
     except Exception as e:
-        print("Error while querying the database for API key:", e)
+        logger.error(f"Error while querying the database for API key: {e}")
         return None
 
 def get_api_key_for_tradingview(user_id):
@@ -205,7 +300,7 @@ def get_api_key_for_tradingview(user_id):
             return decrypt_token(api_key_obj.api_key_encrypted)
         return None
     except Exception as e:
-        print("Error while querying the database for API key:", e)
+        logger.error(f"Error while querying the database for API key: {e}")
         return None
 
 def verify_api_key(provided_api_key):
@@ -225,8 +320,32 @@ def verify_api_key(provided_api_key):
         
         return None
     except Exception as e:
-        print(f"Error verifying API key: {e}")
+        logger.error(f"Error verifying API key: {e}")
         return None
+
+def get_broker_name(provided_api_key):
+    """Get only the broker name for a valid API key with caching"""
+    # Check if broker name is in cache
+    if provided_api_key in broker_cache:
+        return broker_cache[provided_api_key]
+    
+    # Not in cache, need to look it up
+    user_id = verify_api_key(provided_api_key)
+    
+    if user_id:
+        try:
+            auth_obj = Auth.query.filter_by(name=user_id).first()
+            if auth_obj and not auth_obj.is_revoked:
+                # Cache the broker name
+                broker_cache[provided_api_key] = auth_obj.broker
+                return auth_obj.broker
+            else:
+                logger.warning(f"No valid broker found for user_id '{user_id}'.")
+                return None
+        except Exception as e:
+            logger.error(f"Error while querying the database for broker name: {e}")
+            return None
+    return None
 
 def get_auth_token_broker(provided_api_key, include_feed_token=False):
     """Get auth token, feed token (optional) and broker for a valid API key"""
@@ -242,10 +361,10 @@ def get_auth_token_broker(provided_api_key, include_feed_token=False):
                     return decrypted_token, decrypted_feed_token, auth_obj.broker
                 return decrypted_token, auth_obj.broker
             else:
-                print(f"No valid auth token or broker found for user_id '{user_id}'.")
+                logger.warning(f"No valid auth token or broker found for user_id '{user_id}'.")
                 return (None, None, None) if include_feed_token else (None, None)
         except Exception as e:
-            print("Error while querying the database for auth token and broker:", e)
+            logger.error(f"Error while querying the database for auth token and broker: {e}")
             return (None, None, None) if include_feed_token else (None, None)
     else:
         return (None, None, None) if include_feed_token else (None, None)

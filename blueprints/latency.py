@@ -2,7 +2,7 @@ from flask import Blueprint, jsonify, render_template, request, session, Respons
 from database.latency_db import OrderLatency, latency_session
 from utils.session import check_session_validity
 from limiter import limiter
-import logging
+from utils.logging import get_logger
 from sqlalchemy import func
 from collections import defaultdict
 import numpy as np
@@ -11,7 +11,7 @@ import pytz
 import csv
 import io
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 latency_bp = Blueprint('latency_bp', __name__, url_prefix='/latency')
 
@@ -76,7 +76,7 @@ def get_histogram_data(broker=None):
             'max_rtt': float(max_rtt)
         }
         
-        logger.info(f"Histogram data for broker {broker}: {data}")
+        # logger.info(f"Histogram data for broker {broker}: {data}")  # Commented out to reduce log verbosity
         return data
         
     except Exception as e:
@@ -128,7 +128,7 @@ def latency_dashboard():
         if broker:  # Skip None values
             broker_histograms[broker] = get_histogram_data(broker)
     
-    logger.info(f"Broker histograms data: {broker_histograms}")
+    # logger.info(f"Broker histograms data: {broker_histograms}")  # Commented out to reduce log verbosity
     
     # Format timestamps in IST
     for log in recent_logs:

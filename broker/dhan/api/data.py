@@ -1,4 +1,3 @@
-import http.client
 import json
 import os
 from datetime import datetime, timedelta
@@ -6,12 +5,13 @@ import pandas as pd
 from database.token_db import get_br_symbol, get_oa_symbol, get_token
 from broker.dhan.mapping.transform_data import map_exchange_type
 import urllib.parse
-import logging
 import jwt
-import requests
+import httpx
+from utils.httpx_client import get_httpx_client
+from broker.dhan.api.baseurl import get_url
+from utils.logging import get_logger
 
-# Configure logging
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def get_api_response(endpoint, auth, method="POST", payload=''):
@@ -21,7 +21,9 @@ def get_api_response(endpoint, auth, method="POST", payload=''):
     if not client_id:
         raise Exception("Could not extract client ID from auth token")
     
-    conn = http.client.HTTPSConnection("api.dhan.co")
+    # Get the shared httpx client with connection pooling
+    client = get_httpx_client()
+    
     headers = {
         'access-token': AUTH_TOKEN,
         'client-id': client_id,
@@ -29,17 +31,25 @@ def get_api_response(endpoint, auth, method="POST", payload=''):
         'Accept': 'application/json',
     }
     
-    logger.info(f"Making request to {endpoint}")
-    logger.info(f"Headers: {headers}")
-    logger.info(f"Payload: {payload}")
+    url = get_url(endpoint)
     
-    conn.request(method, endpoint, payload, headers)
-    res = conn.getresponse()
-    data = res.read()
-    response = json.loads(data.decode("utf-8"))
+    #logger.info(f"Making request to {url}")
+    #logger.info(f"Headers: {headers}")
+    #logger.info(f"Payload: {payload}")
     
-    logger.info(f"Response status: {res.status}")
-    logger.info(f"Response: {json.dumps(response, indent=2)}")
+    if method == "GET":
+        res = client.get(url, headers=headers)
+    elif method == "POST":
+        res = client.post(url, headers=headers, content=payload)
+    else:
+        res = client.request(method, url, headers=headers, content=payload)
+    
+    # Add status attribute for compatibility with existing codebase
+    res.status = res.status_code
+    response = json.loads(res.text)
+    
+    logger.debug(f"Response status: {res.status}")
+    logger.debug(f"Response: {json.dumps(response, indent=2)}")
     
     # Handle Dhan API error codes
     if response.get('status') == 'failed':
@@ -83,7 +93,7 @@ class BrokerData:
         # Extract security ID and determine exchange segment
         # This needs to be implemented based on your symbol mapping logic
         security_id = get_token(symbol, exchange)  # This should be mapped to Dhan's security ID
-        print(f'exchange: {exchange}')
+        #logger.info(f"exchange: {exchange}")
         if exchange == "NSE":
             exchange_segment = "NSE_EQ"
         elif exchange == "BSE":
@@ -102,19 +112,39 @@ class BrokerData:
         # Simply return the date string as the API expects YYYY-MM-DD format
         return date_str
 
-    def _convert_timestamp_to_ist(self, timestamp: int) -> int:
+    def _convert_timestamp_to_ist(self, timestamp: int, is_daily: bool = False) -> int:
         """Convert UTC timestamp to IST timestamp"""
-        # Convert to datetime in UTC
-        utc_dt = datetime.utcfromtimestamp(timestamp)
-        # Add IST offset (+5:30)
-        ist_dt = utc_dt + timedelta(hours=5, minutes=30)
-        # Return new timestamp
-        return int(ist_dt.timestamp())
+        if is_daily:
+            # For daily data, we want to show just the date
+            # The Dhan API returns timestamps at UTC midnight
+            # We need to adjust to show the correct IST date
+            utc_dt = datetime.utcfromtimestamp(timestamp)
+            # Add IST offset to get the correct IST date
+            ist_dt = utc_dt + timedelta(hours=5, minutes=30)
+            # Create timestamp for start of that IST day (00:00:00)
+            # This will be 18:30 UTC of previous day
+            start_of_day = datetime(ist_dt.year, ist_dt.month, ist_dt.day)
+            # Return timestamp without timezone conversion (pandas will handle display)
+            return int(start_of_day.timestamp() + 19800)  # Add 5:30 hours in seconds
+        else:
+            # For intraday data, convert to IST
+            utc_dt = datetime.utcfromtimestamp(timestamp)
+            # Add IST offset (+5:30)
+            ist_dt = utc_dt + timedelta(hours=5, minutes=30)
+            return int(ist_dt.timestamp())
 
-    def _get_intraday_chunks(self, start_date: str, end_date: str) -> list:
+    def _get_intraday_chunks(self, start_date, end_date) -> list:
         """Split date range into 5-day chunks for intraday data"""
-        start = datetime.strptime(start_date, "%Y-%m-%d")
-        end = datetime.strptime(end_date, "%Y-%m-%d")
+        # Handle both string and datetime.date objects
+        if isinstance(start_date, str):
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+        else:
+            start = datetime.combine(start_date, datetime.min.time())
+        
+        if isinstance(end_date, str):
+            end = datetime.strptime(end_date, "%Y-%m-%d")
+        else:
+            end = datetime.combine(end_date, datetime.min.time())
         chunks = []
         
         while start < end:
@@ -192,15 +222,27 @@ class BrokerData:
         
         raise Exception(f"Unsupported exchange: {exchange}")
 
-    def _is_trading_day(self, date_str: str) -> bool:
+    def _is_trading_day(self, date_str) -> bool:
         """Check if the given date is a trading day (not weekend)"""
-        date = datetime.strptime(date_str, "%Y-%m-%d")
+        # Handle both string and datetime.date objects
+        if isinstance(date_str, str):
+            date = datetime.strptime(date_str, "%Y-%m-%d")
+        else:
+            date = datetime.combine(date_str, datetime.min.time())
         return date.weekday() < 5  # 0-4 are Monday to Friday
 
-    def _adjust_dates(self, start_date: str, end_date: str) -> tuple:
+    def _adjust_dates(self, start_date, end_date) -> tuple:
         """Adjust dates to nearest trading days"""
-        start = datetime.strptime(start_date, "%Y-%m-%d")
-        end = datetime.strptime(end_date, "%Y-%m-%d")
+        # Handle both string and datetime.date objects
+        if isinstance(start_date, str):
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+        else:
+            start = datetime.combine(start_date, datetime.min.time())
+        
+        if isinstance(end_date, str):
+            end = datetime.strptime(end_date, "%Y-%m-%d")
+        else:
+            end = datetime.combine(end_date, datetime.min.time())
         
         # If start date is weekend, move to next Monday
         while start.weekday() >= 5:
@@ -224,7 +266,7 @@ class BrokerData:
         # The API will handle the full day's data automatically
         return date_str, date_str
 
-    def get_history(self, symbol: str, exchange: str, interval: str, start_date: str, end_date: str) -> pd.DataFrame:
+    def get_history(self, symbol: str, exchange: str, interval: str, start_date, end_date) -> pd.DataFrame:
         """
         Get historical data for given symbol
         Args:
@@ -245,30 +287,39 @@ class BrokerData:
                 supported = list(self.timeframe_map.keys())
                 raise Exception(f"Unsupported interval '{interval}'. Supported intervals are: {', '.join(supported)}")
 
+            # Convert datetime.date to string if needed
+            if not isinstance(start_date, str):
+                start_date = start_date.strftime("%Y-%m-%d")
+            if not isinstance(end_date, str):
+                end_date = end_date.strftime("%Y-%m-%d")
+                
             # Adjust dates for trading days
             start_date, end_date = self._adjust_dates(start_date, end_date)
             
             # If both dates are weekends, return empty DataFrame
             if not self._is_trading_day(start_date) and not self._is_trading_day(end_date):
                 logger.info("Both start and end dates are non-trading days")
-                return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
 
             # If start and end dates are same, increase end date by one day
             if start_date == end_date:
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+                if isinstance(end_date, str):
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+                else:
+                    end_dt = datetime.combine(end_date, datetime.min.time()) + timedelta(days=1)
                 end_date = end_dt.strftime("%Y-%m-%d")
-                logger.info(f"Start and end dates are same, increasing end date to: {end_date}")
+                #logger.info(f"Start and end dates are same, increasing end date to: {end_date}")
 
             # Convert symbol to broker format and get securityId
             security_id = get_token(symbol, exchange)
             if not security_id:
                 raise Exception(f"Could not find security ID for {symbol} on {exchange}")
-            print(f'exchange: {exchange}')
+            #logger.info(f"exchange: {exchange}")
             # Get exchange segment and instrument type
             exchange_segment = self._get_exchange_segment(exchange)
             if not exchange_segment:
                 raise Exception(f"Unsupported exchange: {exchange}")
-            print(f'exchange segment: {exchange_segment}')
+            #logger.info(f"exchange segment: {exchange_segment}")
             instrument_type = self._get_instrument_type(exchange, symbol)
             
             all_candles = []
@@ -281,7 +332,10 @@ class BrokerData:
                 # Convert dates to UTC for API request
                 utc_start_date = self._convert_date_to_utc(start_date)
                 # For end date, add one day to include the end date in results
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+                if isinstance(end_date, str):
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+                else:
+                    end_dt = datetime.combine(end_date, datetime.min.time()) + timedelta(days=1)
                 utc_end_date = self._convert_date_to_utc(end_dt.strftime("%Y-%m-%d"))
                 
                 request_data = {
@@ -289,15 +343,16 @@ class BrokerData:
                     "exchangeSegment": exchange_segment,
                     "instrument": instrument_type,
                     "fromDate": utc_start_date,
-                    "toDate": utc_end_date
+                    "toDate": utc_end_date,
+                    "oi": True
                 }
                 
                 # Add expiryCode only for EQUITY
                 if instrument_type == 'EQUITY':
                     request_data["expiryCode"] = 0
                 
-                logger.info(f"Making daily history request to {endpoint}")
-                logger.info(f"Request data: {json.dumps(request_data, indent=2)}")
+                logger.debug(f"Making daily history request to {endpoint}")
+                logger.debug(f"Request data: {json.dumps(request_data, indent=2)}")
                 
                 response = get_api_response(endpoint, self.auth_token, "POST", json.dumps(request_data))
                 
@@ -308,23 +363,31 @@ class BrokerData:
                 lows = response.get('low', [])
                 closes = response.get('close', [])
                 volumes = response.get('volume', [])
+                openinterest = response.get('open_interest', [])
 
                 for i in range(len(timestamps)):
-                    # Convert UTC timestamp to IST
-                    ist_timestamp = self._convert_timestamp_to_ist(timestamps[i])
+                    # Convert UTC timestamp to IST with proper daily formatting
+                    ist_timestamp = self._convert_timestamp_to_ist(timestamps[i], is_daily=True)
                     all_candles.append({
                         'timestamp': ist_timestamp,
                         'open': float(opens[i]) if opens[i] else 0,
                         'high': float(highs[i]) if highs[i] else 0,
                         'low': float(lows[i]) if lows[i] else 0,
                         'close': float(closes[i]) if closes[i] else 0,
-                        'volume': int(float(volumes[i])) if volumes[i] else 0
+                        'volume': int(float(volumes[i])) if volumes[i] else 0,
+                        'oi': int(float(openinterest[i])) if openinterest[i] else 0
                     })
             else:
                 # For intraday data
                 endpoint = "/v2/charts/intraday"
                 
-                if start_date == (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"):
+                # Handle both string and datetime.date objects
+                if isinstance(end_date, str):
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                else:
+                    end_dt = datetime.combine(end_date, datetime.min.time())
+                    
+                if start_date == (end_dt - timedelta(days=1)).strftime("%Y-%m-%d"):
                     # For same day intraday data, use exact time range in IST
                     from_time = start_date
                     to_time = end_date  # This will be the next day as adjusted above
@@ -335,11 +398,12 @@ class BrokerData:
                         "instrument": instrument_type,
                         "interval": self.timeframe_map[interval],
                         "fromDate": from_time,
-                        "toDate": to_time
+                        "toDate": to_time,
+                        "oi": True
                     }
                     
-                    logger.info(f"Making intraday history request to {endpoint}")
-                    logger.info(f"Request data: {json.dumps(request_data, indent=2)}")
+                    logger.debug(f"Making intraday history request to {endpoint}")
+                    logger.debug(f"Request data: {json.dumps(request_data, indent=2)}")
                     
                     try:
                         response = get_api_response(endpoint, self.auth_token, "POST", json.dumps(request_data))
@@ -351,6 +415,7 @@ class BrokerData:
                         lows = response.get('low', [])
                         closes = response.get('close', [])
                         volumes = response.get('volume', [])
+                        openinterest = response.get('open_interest', [])
 
                         for i in range(len(timestamps)):
                             # Convert UTC timestamp to IST
@@ -361,7 +426,8 @@ class BrokerData:
                                 'high': float(highs[i]) if highs[i] else 0,
                                 'low': float(lows[i]) if lows[i] else 0,
                                 'close': float(closes[i]) if closes[i] else 0,
-                                'volume': int(float(volumes[i])) if volumes[i] else 0
+                                'volume': int(float(volumes[i])) if volumes[i] else 0,
+                                'oi': int(float(openinterest[i])) if openinterest[i] else 0
                             })
                     except Exception as e:
                         logger.error(f"Error fetching intraday data: {str(e)}")
@@ -384,11 +450,12 @@ class BrokerData:
                             "instrument": instrument_type,
                             "interval": self.timeframe_map[interval],
                             "fromDate": from_time,
-                            "toDate": to_time
+                            "toDate": to_time,
+                            "oi": True
                         }
                         
-                        logger.info(f"Making intraday history request to {endpoint}")
-                        logger.info(f"Request data: {json.dumps(request_data, indent=2)}")
+                        logger.debug(f"Making intraday history request to {endpoint}")
+                        logger.debug(f"Request data: {json.dumps(request_data, indent=2)}")
                         
                         try:
                             response = get_api_response(endpoint, self.auth_token, "POST", json.dumps(request_data))
@@ -400,7 +467,7 @@ class BrokerData:
                             lows = response.get('low', [])
                             closes = response.get('close', [])
                             volumes = response.get('volume', [])
-
+                            openinterest = response.get('open_interest', [])
                             for i in range(len(timestamps)):
                                 # Convert UTC timestamp to IST
                                 ist_timestamp = self._convert_timestamp_to_ist(timestamps[i])
@@ -410,7 +477,8 @@ class BrokerData:
                                     'high': float(highs[i]) if highs[i] else 0,
                                     'low': float(lows[i]) if lows[i] else 0,
                                     'close': float(closes[i]) if closes[i] else 0,
-                                    'volume': int(float(volumes[i])) if volumes[i] else 0
+                                    'volume': int(float(volumes[i])) if volumes[i] else 0,
+                                    'oi': int(float(openinterest[i])) if openinterest[i] else 0
                                 })
                         except Exception as e:
                             logger.error(f"Error fetching chunk {chunk_start} to {chunk_end}: {str(e)}")
@@ -425,13 +493,18 @@ class BrokerData:
                         # Get today's data from quotes API
                         quotes = self.get_quotes(symbol, exchange)
                         if quotes and quotes.get('ltp', 0) > 0:  # Only add if we got valid data
+                            # Create today's timestamp at start of day (00:00:00) for consistency
+                            today_dt = datetime.strptime(today, "%Y-%m-%d")
+                            today_dt = today_dt.replace(hour=0, minute=0, second=0)
+                            # Add IST offset (5:30 hours = 19800 seconds) to match historical data format
                             today_candle = {
-                                'timestamp': int(datetime.strptime(today + " 15:30:00", "%Y-%m-%d %H:%M:%S").timestamp()),
+                                'timestamp': int(today_dt.timestamp() + 19800),  # Add 5:30 hours in seconds
                                 'open': float(quotes.get('open', 0)),
                                 'high': float(quotes.get('high', 0)),
                                 'low': float(quotes.get('low', 0)),
                                 'close': float(quotes.get('ltp', 0)),  # Use LTP as current close
-                                'volume': int(quotes.get('volume', 0))
+                                'volume': int(quotes.get('volume', 0)),
+                                'oi': int(quotes.get('oi', 0))  # Changed from 'open_interest' to 'oi'
                             }
                             all_candles.append(today_candle)
                     except Exception as e:
@@ -440,7 +513,7 @@ class BrokerData:
             # Create DataFrame from all candles
             df = pd.DataFrame(all_candles)
             if df.empty:
-                df = pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df = pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume','oi'])
             else:
                 # Sort by timestamp and remove duplicates
                 df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp']).reset_index(drop=True)
@@ -462,17 +535,18 @@ class BrokerData:
         """
         try:
             security_id = get_token(symbol, exchange)
-            exchange_type = map_exchange_type(exchange)
+            exchange_type = self._get_exchange_segment(exchange)  # Use the correct method for exchange type
             
-            logger.info(f"Getting quotes for symbol: {symbol}, exchange: {exchange}")
-            logger.info(f"Mapped security_id: {security_id}, exchange_type: {exchange_type}")
+            #logger.info(f"Getting quotes for symbol: {symbol}, exchange: {exchange}")
+            #logger.info(f"Mapped security_id: {security_id}, exchange_type: {exchange_type}")
             
             payload = {
-                exchange_type: [int(security_id)]
+                exchange_type: [int(security_id)]  # Use the proper exchange type for indices
             }
             
             try:
                 response = get_api_response("/v2/marketfeed/quote", self.auth_token, "POST", json.dumps(payload))
+                logger.debug(f"Quotes_Response: {response}")
                 quote_data = response.get('data', {}).get(exchange_type, {}).get(str(security_id), {})
                 
                 if not quote_data:
@@ -494,6 +568,7 @@ class BrokerData:
                     'high': float(quote_data.get('ohlc', {}).get('high', 0)),
                     'low': float(quote_data.get('ohlc', {}).get('low', 0)),
                     'volume': int(quote_data.get('volume', 0)),
+                    'oi': int(quote_data.get('oi', 0)),
                     'bid': 0,  # Will be updated from depth
                     'ask': 0,  # Will be updated from depth
                     'prev_close': float(quote_data.get('ohlc', {}).get('close', 0))
@@ -543,13 +618,13 @@ class BrokerData:
         """
         try:
             security_id = get_token(symbol, exchange)
-            exchange_type = map_exchange_type(exchange)
+            exchange_type = self._get_exchange_segment(exchange)  # Use the correct method for exchange type
             
-            logger.info(f"Getting depth for symbol: {symbol}, exchange: {exchange}")
-            logger.info(f"Mapped security_id: {security_id}, exchange_type: {exchange_type}")
+            #logger.info(f"Getting depth for symbol: {symbol}, exchange: {exchange}")
+            #logger.info(f"Mapped security_id: {security_id}, exchange_type: {exchange_type}")
             
             payload = {
-                exchange_type: [int(security_id)]
+                exchange_type: [int(security_id)]  # Use the proper exchange type for indices
             }
             
             try:

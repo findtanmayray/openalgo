@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(sed:*)",
+      "Bash(python test:*)",
+      "Bash(python3:*)",
+      "Bash(LOG_LEVEL=DEBUG python3 test_colored_logging.py)",
+      "Bash(rm:*)",
+      "Bash(FORCE_COLOR=1 python3 debug_colors.py)",
+      "Bash(rg:*)",
+      "Bash(python:*)",
+      "Bash(timeout:*)",
+      "Bash(ls:*)",
+      "Bash(uv run:*)",
+      "Bash(curl:*)",
+      "Bash(chmod:*)",
+      "Bash(source:*)",
+      "Bash(.venv/Scripts/python.exe:*)",
+      "WebFetch(domain:docs.openalgo.in)",
+      "WebFetch(domain:tradingview.github.io)",
+      "Bash(npm install)",
+      "Bash(npm run build:*)",
+      "Bash(dir:*)",
+      "Bash(docker-compose:*)",
+      "Bash(docker-compose build:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(uv pip show:*)",
+      "Bash(tasklist)",
+      "Bash(findstr:*)",
+      "Bash(uv pip install:*)",
+      "Bash(taskkill:*)",
+      "Bash(copy:*)",
+      "Bash(npm run build:css:*)",
+      "Read(//d/openalgo/**)",
+      "Bash(netstat:*)"
+    ],
+    "deny": []
+  }
+}
